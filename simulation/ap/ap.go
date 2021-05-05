@@ -1,18 +1,22 @@
 package main
 
 import (
+	"bufio"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha512"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"log"
 	"net"
+	"os"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/pbkdf2"
 )
 
@@ -22,30 +26,45 @@ import (
 var ap net.Listener
 
 type handshakeState struct {
-	msgcount     int
 	ptkinstalled bool
 	pmk          []byte
 	ptk          []byte
 	Anonce       []byte
 	Snonce       []byte
-	replay       uint64
+	Counter      uint64
 }
 
-//I don't think I'll implement a packet structure but just let this here
-type packet struct {
-	descr         uint8
-	info          uint16
-	keylen        uint16
-	replaycounter uint64
-	nonce         int
-	mic           int
+//EAPOL key more or less
+type header struct {
+	PacketType     uint8
+	DescriptorType uint8
+	KeyInformation uint16
+	KeyLength      uint16
+	Counter        uint64
+	Nonce          []byte //256 bit, 32 byte
+	Reserved       uint64
+	Mic            []byte //16 byte, 128 bit
+}
+
+func EncodeHeader(pt, dt uint8, ki, kl uint16, c uint64, n []byte) []byte {
+	h := make([]byte, 70)
+	h[0] = byte(pt)
+	h[1] = byte(dt)
+	binary.LittleEndian.PutUint16(h[2:4], ki)
+	binary.LittleEndian.PutUint16(h[4:6], kl)
+	binary.LittleEndian.PutUint64(h[6:14], c)
+	copy(h[14:46], n)
+	binary.LittleEndian.PutUint64(h[46:54], 0)
+	return h
 }
 
 var hs handshakeState
 
 const (
-	password = "abcdefgh"
-	ssid     = "wpa2simulation"
+	PWD        = "abcdefgh"
+	SSID       = "wpa2simulation"
+	LOCAL_MAC  = "BD:B2:12:3F:18:F9"
+	REMOTE_MAC = "6D:BF:EC:03:F0:2B"
 )
 
 func recv(s net.Conn) {
@@ -57,28 +76,39 @@ func recv(s net.Conn) {
 			return
 		}
 		switch msg[0] {
-		case 2:
-			handleMsg2(msg[:n])
-			hs.msgcount++
-			m := buildMsg3()
-			send(m, s)
-			log.Println("Sent msg 3/4")
-		case 4:
-			handleMsg4(msg[:n])
-			hs.msgcount++
-		case 5: //encrypted data packet
-			pt, err := handleEncrypted(msg[:n])
-			if err != nil {
-				log.Println(err)
+		case 3: //handshake
+			c := binary.LittleEndian.Uint64(msg[6:14])
+			switch c {
+			case 0:
+				handleMsg2(msg[:n]) //check your counter also which should be 1
+				m := buildMsg3()
+				send(m, s)
+				log.Println("Sent handshake message 3/4")
+				//start a routine to check if after x seconds we got msg 4
+				go checkAck(s)
+			case 1:
+				handleMsg4(msg[:n])
 			}
-			log.Println("Data: ", string(pt))
+		case 5:
+			log.Println(msg[:n])
+			m, _ := handleEncrypted(msg[:n])
+			log.Println(string(m))
 		}
+	}
+}
+
+func checkAck(s net.Conn) {
+	time.Sleep(5 * time.Second)
+	if !hs.ptkinstalled {
+		m := buildMsg3()
+		send(m, s)
+		log.Println("Sent handshake message 3/4")
 	}
 }
 
 func send(msg []byte, conn net.Conn) {
 	conn.Write(msg)
-	hs.replay++
+	hs.Counter++
 }
 
 func nonce() []byte {
@@ -93,139 +123,128 @@ func nonce() []byte {
 func hmac_hash(msg, key []byte) []byte {
 	h := hmac.New(sha1.New, key)
 	h.Write(msg)
-	return h.Sum(nil)
+	return h.Sum(nil)[:16]
 }
 
-func init() {
-	//intializing values
+func initialize() {
 	hs = handshakeState{
-		msgcount:     0,
 		ptkinstalled: false,
-		pmk:          pbkdf2.Key([]byte(password), []byte(ssid), 4096, 32, sha1.New),
-		ptk:          []byte{},
+		pmk:          pbkdf2.Key([]byte(PWD), []byte(SSID), 4096, 32, sha1.New),
+		ptk:          nil,
 		Anonce:       nonce(),
 		Snonce:       make([]byte, 32),
-		replay:       0,
+		Counter:      0,
 	}
 }
 
 func handleMsg2(tmp []byte) {
-	//tmp[0] is message type
-	//tmp[1:9] is the counter
-	copy(hs.Snonce, tmp[9:41])
+	copy(hs.Snonce, tmp[14:46])
 	rnd := make([]byte, 98)
 	copy(rnd[:32], hs.Anonce)
 	copy(rnd[32:64], hs.Snonce)
-	copy(rnd[64:81], []byte("BD:B2:12:3F:18:F9"))
-	copy(rnd[81:], []byte("6D:BF:EC:03:F0:2B"))
+	copy(rnd[64:81], []byte(LOCAL_MAC))
+	copy(rnd[81:], []byte(REMOTE_MAC))
 
-	hs.ptk = pbkdf2.Key(hs.pmk, rnd, 4096, 64, sha1.New)
-	//mic := hmac_hash(tmp[:41], hs.ptk[:16])[:16]
-
-	if !verifyMIC(tmp[:len(tmp)-16], tmp[len(tmp)-16:]) {
+	hs.ptk = prf384(hs.pmk, rnd) //384 bit per gcm o ccm
+	recvMic := append([]byte{}, tmp[54:70]...)
+	copy(tmp[54:70], make([]byte, 16))
+	if !verifyMIC(tmp, recvMic) {
 		log.Fatal("MIC check failed")
 	}
-	log.Println("MIC check valid")
-	//client is auth here...
+}
+
+func prf384(key, data []byte) []byte {
+	//non è veramente così ma ok
+	k := make([]byte, 48)
+	f := hkdf.New(sha512.New384, key, data, nil)
+	f.Read(k)
+	return k
 }
 
 func encrypt(msg []byte) []byte {
 	//Ecnryption key in WPA2 is the TK, taken from those bits of the PTK
-	key := append([]byte{}, hs.ptk[32:48]...)
+	key := append([]byte{}, hs.ptk[32:]...)
 	nonce := make([]byte, 12)
-	binary.LittleEndian.PutUint64(nonce, hs.replay)
+	binary.LittleEndian.PutUint64(nonce, hs.Counter)
 	b, _ := aes.NewCipher(key)
 	c, _ := cipher.NewGCM(b)
 	return c.Seal(nil, nonce, msg, nil)
 }
 
 func handleEncrypted(msg []byte) ([]byte, error) {
-	remoteCounter := binary.LittleEndian.Uint64(msg[1:9])
+	rCounter := binary.LittleEndian.Uint64(msg[1:9])
 	log.Println(msg)
-	if remoteCounter == hs.replay+1 {
-		hs.replay++
-		return decrypt(msg[9:])
+	if rCounter == hs.Counter {
+		hs.Counter++
+		n := make([]byte, 12)
+		copy(n[:8], msg[1:9])
+		copy(n[8:], []byte(REMOTE_MAC)[:4])
+		log.Println(msg)
+		return decrypt(msg[9:], n)
 	}
-	return []byte{}, errors.New("Replay counter mismatch")
+	return []byte{}, errors.New("replay counter mismatch")
 }
 
-func decrypt(msg []byte) ([]byte, error) {
-	key := append([]byte{}, hs.ptk[32:48]...)
-	nonce := make([]byte, 12)
-	binary.LittleEndian.PutUint64(nonce, hs.replay)
-	log.Println(hs.replay, msg)
+func decrypt(msg, nonce []byte) ([]byte, error) {
+	key := hs.ptk[32:]
 	b, _ := aes.NewCipher(key)
 	c, _ := cipher.NewGCM(b)
 	return c.Open(nil, nonce, msg, nil)
 }
 
 func buildMsg1() []byte {
-	msg := make([]byte, 41)
-	msg[0] = 1
-	binary.BigEndian.PutUint64(msg[1:9], hs.replay)
-	copy(msg[9:], hs.Anonce)
-	return msg
+	h := EncodeHeader(3, 2, 0, 16, hs.Counter, hs.Anonce)
+	return h
 }
 
 func buildMsg3() []byte {
-	msg := make([]byte, 36)
-	msg[0] = 3
-	binary.BigEndian.PutUint64(msg[1:9], hs.replay)
-	copy(msg[9:20], []byte("install_key"))
-	//msg := append([]byte(hs.replay), []byte("install key")...)
-	mic := hmac_hash(msg[:20], hs.ptk[:16])[:16]
-	copy(msg[20:], mic)
+	h := EncodeHeader(3, 2, 0, 16, hs.Counter, hs.Anonce)
+	msg := append(h, []byte("key_installation")...)
+	mic := hmac_hash(msg, hs.ptk[:16])
+	copy(msg[54:70], mic)
 	return msg
 }
 
-func sendMsg3(s net.Conn) {
-	msg := append([]byte{3}, []byte("key_installation")...)
-	mic := hmac_hash(msg, hs.ptk[:16])[:16]
-	s.Write(append(msg, mic...))
-	//send(append(msg, mic...)) //msg 3 of 4 must be stopped from attacker
-	log.Println("Sent handshake message 3/4")
-}
-
 func handleMsg4(tmp []byte) {
-
-	if !verifyMIC(tmp[:len(tmp)-16], tmp[len(tmp)-16:]) {
+	recvMic := append([]byte{}, tmp[54:70]...)
+	copy(tmp[54:70], make([]byte, 16))
+	if !verifyMIC(tmp, recvMic) {
 		log.Fatal("MIC check failed")
 	}
-	//installing current PTK
-	hs.replay = 0
+	hs.Counter = 0
 	hs.ptkinstalled = true
-	//setting 48bit nonce to zero
 	log.Println("PTK installed")
 }
 
 func verifyMIC(data, recvMic []byte) bool {
-	mic := hmac_hash(data, hs.ptk[:16])[:16]
+	mic := hmac_hash(data, hs.ptk[:16])
 	return cmp.Equal(mic, recvMic)
 }
 
-func main() {
-
-	fmt.Println("Start access point...")
+func run() {
 	var err error
 	ap, err = net.Listen("tcp", ":8000")
 	if err != nil {
 		log.Fatal(err)
 		return
 	}
-
-	fmt.Println("Waiting for conn..")
+	log.Println("Waiting for connection..")
 	s, _ := ap.Accept()
-	fmt.Println("Connected")
+	log.Println("Connected")
 
 	go recv(s)
-
-	m := buildMsg1()
-	hs.msgcount++
-	send(m, s)
-	log.Println("Sent msg 1/4")
+	//insert commang to start handshake
+	r := bufio.NewReader(os.Stdin)
+	log.Print("Press ENTER to start the simulation...")
+	r.ReadString('\n')
+	initialize()
+	msg := buildMsg1()
+	hs.Counter++
+	send(msg, s)
 	for {
-		if hs.msgcount == 5 {
-			break
-		}
-	}
+	} //do nothing
+}
+
+func main() {
+	run()
 }
