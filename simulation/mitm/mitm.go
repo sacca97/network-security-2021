@@ -29,11 +29,6 @@ func handleIncomingAP() {
 	}
 }
 
-func printHex(msg []byte) {
-	dst := hex.EncodeToString(msg)
-	fmt.Println(dst)
-}
-
 func handleIncomingClient() {
 	msg := make([]byte, 128)
 	for {
@@ -90,7 +85,4 @@ func run() {
 
 func main() {
 	run()
-	//recv()
-	// run loop forever (or until ctrl-c)
-
 }
