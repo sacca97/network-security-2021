@@ -25,7 +25,6 @@ func handleIncomingAP() {
 		if n == 0 {
 			continue
 		}
-		fmt.Println("Forwarding message AP -> CLIENT")
 		client.Write(msg[:n])
 	}
 }
@@ -48,19 +47,18 @@ func handleIncomingClient() {
 			switch c {
 			case 1:
 				if firstTime {
-					fmt.Printf("Blocking handshake message CLIENT -> AP\n")
+					fmt.Printf("Blocking 4th handshake message CLIENT -> AP\n")
 				} else {
-					fmt.Printf("Forwarding second 4th handshake message CLIENT -> AP\n")
+					fmt.Printf("Forwarding 4th handshake message CLIENT -> AP\n")
 					ap.Write(msg[:n])
 				}
 			default:
-				fmt.Printf("Forwarding handshake message CLIENT -> AP\n")
 				ap.Write(msg[:n])
 			}
 		case 5:
 			if firstTime {
 				firstTime = false
-				fmt.Println("Blocking Encrypted message: ", hex.EncodeToString(msg[:n]))
+				fmt.Println("Blocking Encrypted message:   ", hex.EncodeToString(msg[:n]))
 			} else {
 				fmt.Println("Forwarding Encrypted message: ", hex.EncodeToString(msg[:n]))
 				ap.Write(msg[:n])

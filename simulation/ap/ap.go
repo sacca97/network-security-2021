@@ -15,7 +15,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/crypto/hkdf"
@@ -83,13 +82,14 @@ func recv(s net.Conn) {
 			case 0:
 				handleMsg2(msg[:n]) //check your counter also which should be 1
 				m := buildMsg3()
+				fmt.Println("\nSending handshake message 3/4")
 				send(m, s)
-				fmt.Println("Sent handshake message 3/4")
-				fmt.Println(hs.Counter)
+
+				checkAck(s)
 				//start a routine to check if after x seconds we got msg 4
-				go checkAck(s)
-			case 1:
-				handleMsg4(msg[:n])
+				//go checkAck(s)
+			//case 1:
+			//	handleMsg4(msg[:n])
 			default:
 				handleMsg4(msg[:n])
 			}
@@ -101,15 +101,16 @@ func recv(s net.Conn) {
 }
 
 func checkAck(s net.Conn) {
-	time.Sleep(15 * time.Second)
+	//time.Sleep(15 * time.Second)
 	if !hs.ptkinstalled {
 		m := buildMsg3()
+		fmt.Println("\nSending handshake message 3/4")
 		send(m, s)
-		fmt.Println("Sent handshake message 3/4")
 	}
 }
 
 func send(msg []byte, conn net.Conn) {
+	waitInput()
 	conn.Write(msg)
 	hs.Counter++
 }
@@ -140,23 +141,17 @@ func initialize() {
 	}
 }
 
-func printHex(msg []byte) {
-	dst := hex.EncodeToString(msg)
-	fmt.Println(dst)
-}
-
 func handleMsg2(tmp []byte) {
-	time.Sleep(5 * time.Second)
 	copy(hs.Snonce, tmp[14:46])
 	rnd := make([]byte, 98)
 	copy(rnd[:32], hs.Anonce)
 	copy(rnd[32:64], hs.Snonce)
 	copy(rnd[64:81], []byte(LOCAL_MAC))
 	copy(rnd[81:], []byte(REMOTE_MAC))
-	fmt.Println("Received handshake message 2/4")
-	fmt.Println("	SNonce: ", hex.EncodeToString(hs.Snonce))
+	fmt.Println("\nReceived handshake message 2/4")
+	fmt.Println("\n\rSNonce: ", hex.EncodeToString(hs.Snonce))
 	hs.ptk = prf384(hs.pmk, rnd) //384 bit per gcm o ccm
-	fmt.Println("	Derived PTK: ", hex.EncodeToString(hs.ptk))
+	fmt.Println("\n\rDerived PTK: ", hex.EncodeToString(hs.ptk))
 	recvMic := append([]byte{}, tmp[54:70]...)
 	copy(tmp[54:70], make([]byte, 16))
 	if !verifyMIC(tmp, recvMic) {
@@ -189,6 +184,9 @@ func handleEncrypted(msg []byte) ([]byte, error) {
 		n := make([]byte, 12)
 		copy(n[:8], msg[1:9])
 		copy(n[8:], []byte(REMOTE_MAC)[:4])
+		fmt.Println("Nonce (counter + MAC): ", hex.EncodeToString(n))
+		fmt.Println("Key: ", hex.EncodeToString(hs.ptk[32:]))
+
 		return decrypt(msg[9:], n)
 	}
 	return []byte{}, errors.New("replay counter mismatch")
@@ -215,6 +213,7 @@ func buildMsg3() []byte {
 }
 
 func handleMsg4(tmp []byte) {
+	fmt.Println("Received handshake message 4/4")
 	recvMic := append([]byte{}, tmp[54:70]...)
 	copy(tmp[54:70], make([]byte, 16))
 	if !verifyMIC(tmp, recvMic) {
@@ -223,13 +222,16 @@ func handleMsg4(tmp []byte) {
 	hs.Counter = 0
 	hs.ptkinstalled = true
 	fmt.Println("PTK installed")
-	time.Sleep(5 * time.Second)
-
 }
 
 func verifyMIC(data, recvMic []byte) bool {
 	mic := hmac_hash(data, hs.ptk[:16])
 	return cmp.Equal(mic, recvMic)
+}
+
+func waitInput() {
+	r := bufio.NewReader(os.Stdin)
+	r.ReadString('\n')
 }
 
 func run() {
@@ -241,20 +243,18 @@ func run() {
 	}
 	fmt.Println("Waiting for connection..")
 	s, _ := ap.Accept()
-	fmt.Println("Connected")
+	fmt.Println("Client connected")
 
-	go recv(s)
-	//insert commang to start handshake
-	r := bufio.NewReader(os.Stdin)
-	log.Print("Press ENTER to start the simulation...")
-	r.ReadString('\n')
+	//go recv(s)
+
+	fmt.Println("Press ENTER to start the simulation...")
+	waitInput()
 	initialize()
 	msg := buildMsg1()
-	printHex(msg)
-	hs.Counter++
+	fmt.Println("\nSending handshake message 1/4: ", hex.EncodeToString(msg))
 	send(msg, s)
-	for {
-	} //do nothing
+	recv(s)
+	//for {	} //do nothing
 }
 
 func main() {
