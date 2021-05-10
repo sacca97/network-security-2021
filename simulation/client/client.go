@@ -8,6 +8,8 @@ import (
 	"crypto/sha1"
 	"crypto/sha512"
 	"encoding/binary"
+	"encoding/hex"
+	"fmt"
 	"log"
 	"net"
 	"time"
@@ -57,6 +59,11 @@ func send(msg []byte, conn net.Conn) {
 	hs.Counter++
 }
 
+func printHex(msg []byte) {
+	dst := hex.EncodeToString(msg)
+	fmt.Println(dst)
+}
+
 func recv(s net.Conn) {
 
 	//defer conn.Close()
@@ -65,7 +72,7 @@ func recv(s net.Conn) {
 		n, err := s.Read(msg)
 
 		if err != nil {
-			log.Println("Connection closed by the server")
+			fmt.Println("Connection closed by the server")
 			return
 		}
 		if n == 0 {
@@ -80,19 +87,28 @@ func recv(s net.Conn) {
 				handleMsg1(msg[:n])
 				m := buildMsg2()
 				send(m, s)
-				log.Println("Sent handshake message 2/4")
+				fmt.Println("Sent handshake message 2/4")
+				break
 			case 1:
 				handleMsg3(msg[:n])
 				m := buildMsg4()
 				send(m, s)
 				hs.Counter = 0
-				log.Println("Sent handshake message 4/4")
-				//start sending data packets
+				hs.ptkinstalled = true
+				fmt.Println("Sent handshake message 4/4")
+				time.Sleep(1 * time.Second)
 				sendDataPacket(s)
-				//sendDataPacket(s)
-				//sendDataPacket(s)
-			case 4:
-				//no
+			case 2:
+				handleMsg3(msg[:n])
+				fmt.Println(hs.Counter)
+				hs.Counter++
+				m := buildMsg4()
+				send(m, s)
+				hs.Counter = 0
+				hs.ptkinstalled = true
+				fmt.Println("Sent handshake message 4/4")
+				time.Sleep(2 * time.Second)
+				sendDataPacket(s)
 			}
 		case 5:
 			//handleEncrypted(msg[:n])
@@ -134,14 +150,17 @@ func prf384(key, data []byte) []byte {
 }
 
 func handleMsg1(tmp []byte) {
+	time.Sleep(5 * time.Second)
 	copy(hs.Anonce, tmp[14:46])
 	rnd := make([]byte, 98)
 	copy(rnd[:32], hs.Anonce)
 	copy(rnd[32:64], hs.Snonce)
 	copy(rnd[64:81], []byte(REMOTE_MAC))
 	copy(rnd[81:], []byte(LOCAL_MAC))
-
+	fmt.Println("Received handshake message 1/4")
+	fmt.Println("	ANonce: ", hex.EncodeToString(hs.Anonce))
 	hs.ptk = prf384(hs.pmk, rnd)
+	fmt.Println("	Derived PTK: ", hex.EncodeToString(hs.ptk))
 }
 
 func buildMsg2() []byte {
@@ -160,6 +179,8 @@ func handleMsg3(msg []byte) {
 	if !verifyMIC(msg, recvMic) {
 		log.Fatal("MIC check failed")
 	}
+	time.Sleep(5 * time.Second)
+
 }
 
 func buildMsg4() []byte {
@@ -167,24 +188,24 @@ func buildMsg4() []byte {
 	msg := append(h, []byte("confirm_key_installation")...)
 	mic := hmac_hash(msg, hs.ptk[:16])
 	copy(msg[54:70], mic)
-	hs.ptkinstalled = true
-	log.Println("PTK installed")
+	fmt.Println("PTK installed")
 	return msg
 }
 
 func sendDataPacket(s net.Conn) {
-	time.Sleep(2 * time.Second)
-	m := []byte("thisisatestmessage")
+
+	m := nonce()[:16]
 	msg := make([]byte, 9)
-	msg[0] = byte(5)
+	msg[0] = 5
 	binary.LittleEndian.PutUint64(msg[1:9], hs.Counter)
 	n := make([]byte, 12)
 	copy(n[:8], msg[1:9])
 	copy(n[8:], []byte(LOCAL_MAC)[:4])
-	log.Println(n)
+	fmt.Println("Nonce: ", hex.EncodeToString(n))
 	enc := encrypt(m, n)
-	log.Println("Sending encrypted packet...")
-	send(append(msg, enc...), s)
+	final := append(msg, enc...)
+	fmt.Println("Sending encrypted packet: ", hex.EncodeToString(final))
+	send(final, s)
 }
 
 func verifyMIC(data, recvMic []byte) bool {
@@ -203,7 +224,6 @@ func encrypt(msg, nonce []byte) []byte {
 		log.Fatal(err)
 	}
 	ct := c.Seal(nil, nonce, msg, nil)
-	log.Println(ct)
 	return ct
 }
 
@@ -218,6 +238,7 @@ func run() {
 	if err != nil {
 		log.Fatal("Server unavailable")
 	}
+	fmt.Println("Client connected to the AP")
 	recv(s)
 
 }
@@ -235,7 +256,5 @@ func prf(k, a, b []byte) []byte {
 }
 
 func main() {
-	//log.Println(len(prf([]byte("SIMOLAPORCODIO"), []byte("lucamerlivocalist"), []byte("marcomalatestaluomochepiace"))))
-
 	run()
 }

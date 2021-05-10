@@ -9,7 +9,9 @@ import (
 	"crypto/sha1"
 	"crypto/sha512"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -72,8 +74,7 @@ func recv(s net.Conn) {
 	for {
 		n, err := s.Read(msg)
 		if err != nil {
-			log.Println("Connection closed by the client")
-			return
+			log.Fatal("Connection closed by the client")
 		}
 		switch msg[0] {
 		case 3: //handshake
@@ -83,26 +84,28 @@ func recv(s net.Conn) {
 				handleMsg2(msg[:n]) //check your counter also which should be 1
 				m := buildMsg3()
 				send(m, s)
-				log.Println("Sent handshake message 3/4")
+				fmt.Println("Sent handshake message 3/4")
+				fmt.Println(hs.Counter)
 				//start a routine to check if after x seconds we got msg 4
 				go checkAck(s)
 			case 1:
 				handleMsg4(msg[:n])
+			default:
+				handleMsg4(msg[:n])
 			}
 		case 5:
-			log.Println(msg[:n])
 			m, _ := handleEncrypted(msg[:n])
-			log.Println(string(m))
+			fmt.Println(hex.EncodeToString(m))
 		}
 	}
 }
 
 func checkAck(s net.Conn) {
-	time.Sleep(5 * time.Second)
+	time.Sleep(15 * time.Second)
 	if !hs.ptkinstalled {
 		m := buildMsg3()
 		send(m, s)
-		log.Println("Sent handshake message 3/4")
+		fmt.Println("Sent handshake message 3/4")
 	}
 }
 
@@ -137,15 +140,23 @@ func initialize() {
 	}
 }
 
+func printHex(msg []byte) {
+	dst := hex.EncodeToString(msg)
+	fmt.Println(dst)
+}
+
 func handleMsg2(tmp []byte) {
+	time.Sleep(5 * time.Second)
 	copy(hs.Snonce, tmp[14:46])
 	rnd := make([]byte, 98)
 	copy(rnd[:32], hs.Anonce)
 	copy(rnd[32:64], hs.Snonce)
 	copy(rnd[64:81], []byte(LOCAL_MAC))
 	copy(rnd[81:], []byte(REMOTE_MAC))
-
+	fmt.Println("Received handshake message 2/4")
+	fmt.Println("	SNonce: ", hex.EncodeToString(hs.Snonce))
 	hs.ptk = prf384(hs.pmk, rnd) //384 bit per gcm o ccm
+	fmt.Println("	Derived PTK: ", hex.EncodeToString(hs.ptk))
 	recvMic := append([]byte{}, tmp[54:70]...)
 	copy(tmp[54:70], make([]byte, 16))
 	if !verifyMIC(tmp, recvMic) {
@@ -173,13 +184,11 @@ func encrypt(msg []byte) []byte {
 
 func handleEncrypted(msg []byte) ([]byte, error) {
 	rCounter := binary.LittleEndian.Uint64(msg[1:9])
-	log.Println(msg)
 	if rCounter == hs.Counter {
 		hs.Counter++
 		n := make([]byte, 12)
 		copy(n[:8], msg[1:9])
 		copy(n[8:], []byte(REMOTE_MAC)[:4])
-		log.Println(msg)
 		return decrypt(msg[9:], n)
 	}
 	return []byte{}, errors.New("replay counter mismatch")
@@ -213,7 +222,9 @@ func handleMsg4(tmp []byte) {
 	}
 	hs.Counter = 0
 	hs.ptkinstalled = true
-	log.Println("PTK installed")
+	fmt.Println("PTK installed")
+	time.Sleep(5 * time.Second)
+
 }
 
 func verifyMIC(data, recvMic []byte) bool {
@@ -228,9 +239,9 @@ func run() {
 		log.Fatal(err)
 		return
 	}
-	log.Println("Waiting for connection..")
+	fmt.Println("Waiting for connection..")
 	s, _ := ap.Accept()
-	log.Println("Connected")
+	fmt.Println("Connected")
 
 	go recv(s)
 	//insert commang to start handshake
@@ -239,6 +250,7 @@ func run() {
 	r.ReadString('\n')
 	initialize()
 	msg := buildMsg1()
+	printHex(msg)
 	hs.Counter++
 	send(msg, s)
 	for {
